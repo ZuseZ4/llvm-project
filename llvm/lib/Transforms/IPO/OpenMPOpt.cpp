@@ -1580,6 +1580,313 @@ private:
     }
     return false;
   }
+  /*
+   *
+  store ptr %A, ptr %.offload_baseptrs, align 8
+  store ptr %A, ptr %.offload_ptrs, align 8
+  store i64 24, ptr %.offload_sizes, align 8
+  %4 = getelementptr inbounds nuw i8, ptr %.offload_baseptrs, i64 8
+  store ptr %x, ptr %4, align 8
+  %5 = getelementptr inbounds nuw i8, ptr %.offload_ptrs, i64 8
+  store ptr %x, ptr %5, align 8
+  %6 = getelementptr inbounds nuw i8, ptr %.offload_sizes, i64 8
+  store i64 12, ptr %6, align 8
+  %7 = getelementptr inbounds nuw i8, ptr %.offload_baseptrs, i64 16
+  store ptr %y, ptr %7, align 8
+  %8 = getelementptr inbounds nuw i8, ptr %.offload_ptrs, i64 16
+  store ptr %y, ptr %8, align 8
+  %9 = getelementptr inbounds nuw i8, ptr %.offload_sizes, i64 16
+  store i64 8, ptr %9, align 8
+  call void @__tgt_target_data_begin_mapper(ptr nonnull @anon.0d765687ffa6b0485535600138e53f6d.1, i64 -1, i32 3, ptr nonnull %.offload_baseptrs, ptr nonnull %.offload_ptrs, ptr nonnull %.offload_sizes, ptr nonnull @.offload_maptypes._RNvCslphxOJntq1u_4opts21rocblas_sgemv_wrapper.begin, ptr null, ptr null)
+  %10 = call ptr @omp_get_mapped_ptr(ptr nonnull %A, i32 0) #0
+  %11 = call ptr @omp_get_mapped_ptr(ptr nonnull %x, i32 0) #0
+  %12 = call ptr @omp_get_mapped_ptr(ptr nonnull %y, i32 0) #0
+; call opts::rocblas_sgemv_wrapper
+  call fastcc void @_RNvCslphxOJntq1u_4opts21rocblas_sgemv_wrapper(ptr %10, ptr %11, ptr %12)
+  call void @__tgt_target_data_end_mapper(ptr nonnull @anon.0d765687ffa6b0485535600138e53f6d.1, i64 -1, i32 3, ptr nonnull %.offload_baseptrs, ptr nonnull %.offload_ptrs, ptr nonnull %.offload_sizes, ptr nonnull @.offload_maptypes._RNvCslphxOJntq1u_4opts21rocblas_sgemv_wrapper.end, ptr null, ptr null)
+  store ptr %A, ptr %.offload_baseptrs1, align 8
+  store ptr %A, ptr %.offload_ptrs2, align 8
+  store i64 24, ptr %.offload_sizes3, align 8
+  %13 = getelementptr inbounds nuw i8, ptr %.offload_baseptrs1, i64 8
+  store ptr %x, ptr %13, align 8
+  %14 = getelementptr inbounds nuw i8, ptr %.offload_ptrs2, i64 8
+  store ptr %x, ptr %14, align 8
+  %15 = getelementptr inbounds nuw i8, ptr %.offload_sizes3, i64 8
+  store i64 12, ptr %15, align 8
+  %16 = getelementptr inbounds nuw i8, ptr %.offload_baseptrs1, i64 16
+  store ptr %y, ptr %16, align 8
+  %17 = getelementptr inbounds nuw i8, ptr %.offload_ptrs2, i64 16
+  store ptr %y, ptr %17, align 8
+  %18 = getelementptr inbounds nuw i8, ptr %.offload_sizes3, i64 16
+  store i64 8, ptr %18, align 8
+  call void @__tgt_target_data_begin_mapper(ptr nonnull @anon.0d765687ffa6b0485535600138e53f6d.1, i64 -1, i32 3, ptr nonnull %.offload_baseptrs1, ptr nonnull %.offload_ptrs2, ptr nonnull %.offload_sizes3, ptr nonnull @.offload_maptypes._RNvCslphxOJntq1u_4opts21rocblas_sgemv_wrapper.begin, ptr null, ptr null)
+  %19 = call ptr @omp_get_mapped_ptr(ptr nonnull %A, i32 0) #0
+  %20 = call ptr @omp_get_mapped_ptr(ptr nonnull %x, i32 0) #0
+  %21 = call ptr @omp_get_mapped_ptr(ptr nonnull %y, i32 0) #0
+; call opts::rocblas_sgemv_wrapper
+  call fastcc void @_RNvCslphxOJntq1u_4opts21rocblas_sgemv_wrapper(ptr %19, ptr %20, ptr %21)
+  call void @__tgt_target_data_end_mapper(ptr nonnull @anon.0d765687ffa6b0485535600138e53f6d.1, i64 -1, i32 3, ptr nonnull %.offload_baseptrs1, ptr nonnull %.offload_ptrs2, ptr nonnull %.offload_sizes3, ptr nonnull @.offload_maptypes._RNvCslphxOJntq1u_4opts21rocblas_sgemv_wrapper.end, ptr null, ptr null)
+   */
+ 
+// Reuse the descriptor arrays (baseptrs/ptrs/sizes) of a dominating
+// __tgt_target_data_begin_mapper for a later begin (and its matching end) if
+// the stored values in those arrays are identical.
+// Assumption: the canonical arrays are not clobbered between the two begins.
+// Reuse the descriptor arrays (baseptrs/ptrs/sizes) of an earlier
+// __tgt_target_data_begin_mapper for later begins (and their matching ends) if
+// the stored values in those arrays are identical.
+//
+// Key fix vs. in-callback rewriting:
+//   - We first COLLECT all begin calls via foreachUse (no IR mutation),
+//   - then we build begin->end pairing and REWRITE in a second pass.
+// This avoids invalidating the foreachUse traversal.
+//
+// Assumption (as requested): canonical arrays are not clobbered between begins.
+// Reuse descriptor arrays (baseptrs/ptrs/sizes) across repeated target_data
+// begin/end mapper pairs.
+//
+// Maptypes handling:
+//   - Begin<->End pairing IGNORES maptypes (because begin/end maptypes differ).
+//   - Reuse matching among BEGINS still compares begin-maptypes.
+//   - Reuse rewriting of ENDS compares end-maptypes (only rewrite an end if its
+//     maptypes matches the canonical end’s maptypes for that reuse-class).
+bool reuseVariables(OMPInformationCache::RuntimeFunctionInfo &BeginRFI,
+                    OMPInformationCache::RuntimeFunctionInfo &EndRFI) {
+  bool Changed = false;
+
+  auto rewriteArrays = [&](CallInst &CI, Value *BaseArr, Value *PtrArr,
+                           Value *SizeArr) {
+    CI.setArgOperand(OffloadArray::BasePtrsArgNum, BaseArr);
+    CI.setArgOperand(OffloadArray::PtrsArgNum, PtrArr);
+    CI.setArgOperand(OffloadArray::SizesArgNum, SizeArr);
+  };
+
+  // With dc6b248: StoredValues is the canonical representation (alloca/global).
+  auto sameOffloadArrays = [](ArrayRef<OffloadArray> A,
+                              ArrayRef<OffloadArray> B) -> bool {
+    for (unsigned Idx = 0; Idx < 3; ++Idx)
+      if (A[Idx].StoredValues != B[Idx].StoredValues)
+        return false;
+    return true;
+  };
+
+  auto hashBeginClass = [&](CallInst &CI, ArrayRef<OffloadArray> OAs) -> size_t {
+    size_t H = 0;
+    auto mix = [&](Value *V) {
+      H = llvm::detail::combineHashValue(H, (size_t)V);
+    };
+
+    // Begin identity + begin-maptypes (begins-only equivalence class).
+    mix(CI.getArgOperand(0)); // ident
+    mix(CI.getArgOperand(1)); // device id
+    mix(CI.getArgOperand(2)); // num args
+    mix(CI.getArgOperand(OffloadArray::MapTypeArgNum)); // BEGIN maptypes operand
+
+    // Descriptor contents: baseptrs/ptrs/sizes StoredValues.
+    for (unsigned Arr = 0; Arr < 3; ++Arr)
+      for (Value *SV : OAs[Arr].StoredValues)
+        mix(SV);
+
+    return H;
+  };
+
+  DenseMap<Function *, SmallVector<CallInst *, 16>> BeginsInFunc;
+  DenseMap<Function *, SmallVector<CallInst *, 16>> EndsInFunc;
+
+  auto collectBegins = [&](Use &U, Function &) -> bool {
+    if (CallInst *B = getCallIfRegularCall(U, &BeginRFI))
+      BeginsInFunc[B->getFunction()].push_back(B);
+    return false;
+  };
+  auto collectEnds = [&](Use &U, Function &) -> bool {
+    if (CallInst *E = getCallIfRegularCall(U, &EndRFI))
+      EndsInFunc[E->getFunction()].push_back(E);
+    return false;
+  };
+
+  BeginRFI.foreachUse(SCC, collectBegins);
+  EndRFI.foreachUse(SCC, collectEnds);
+
+  auto buildBBIndex = [&](Function &F) {
+    DenseMap<BasicBlock *, unsigned> BBIndex;
+    unsigned Idx = 0;
+    for (BasicBlock &BB : F)
+      BBIndex[&BB] = Idx++;
+    return BBIndex;
+  };
+  auto instLess = [&](const DenseMap<BasicBlock *, unsigned> &BBIndex,
+                      Instruction *A, Instruction *B) -> bool {
+    if (A->getParent() != B->getParent())
+      return BBIndex.lookup(A->getParent()) < BBIndex.lookup(B->getParent());
+    return A->comesBefore(B);
+  };
+
+  // Pairing key ignores maptypes (begin/end differ there).
+  struct PairKey {
+    Value *Ident;
+    Value *Dev;
+    Value *NArgs;
+  };
+  auto makePairKey = [&](CallInst *CI) -> PairKey {
+    return {CI->getArgOperand(0), CI->getArgOperand(1), CI->getArgOperand(2)};
+  };
+  auto hashPairKey = [&](const PairKey &K) -> size_t {
+    size_t H = 0;
+    H = llvm::detail::combineHashValue(H, (size_t)K.Ident);
+    H = llvm::detail::combineHashValue(H, (size_t)K.Dev);
+    H = llvm::detail::combineHashValue(H, (size_t)K.NArgs);
+    return H;
+  };
+  auto samePairKey = [&](const PairKey &A, const PairKey &B) -> bool {
+    return A.Ident == B.Ident && A.Dev == B.Dev && A.NArgs == B.NArgs;
+  };
+
+  // Canonical per begin-class.
+  struct Canonical {
+    Value *BaseArr = nullptr;
+    Value *PtrArr = nullptr;
+    Value *SizeArr = nullptr;
+
+    Value *Ident = nullptr;
+    Value *Dev = nullptr;
+    Value *NArgs = nullptr;
+
+    // Maptypes compared within begins / within ends:
+    Value *BeginMapTypesArray = nullptr; // from OAs[3].Array at begin
+    Value *EndMapTypesArray = nullptr;   // from OAs[3].Array at end
+
+    OffloadArray OAs[4]; // baseptrs/ptrs/sizes/maptypes snapshot for canonical
+  };
+
+  for (auto &KV : BeginsInFunc) {
+    Function *F = KV.first;
+    auto &Begins = KV.second;
+
+    auto BBIndex = buildBBIndex(*F);
+
+    llvm::sort(Begins, [&](CallInst *A, CallInst *B) {
+      return instLess(BBIndex, A, B);
+    });
+
+    SmallVector<CallInst *, 16> Ends;
+    if (auto It = EndsInFunc.find(F); It != EndsInFunc.end())
+      Ends = It->second;
+
+    llvm::sort(Ends, [&](CallInst *A, CallInst *B) {
+      return instLess(BBIndex, A, B);
+    });
+
+    DenseMap<CallInst *, CallInst *> BeginToEnd;
+    DenseMap<size_t, SmallVector<std::pair<PairKey, CallInst *>, 2>> Open;
+
+    auto pushBegin = [&](CallInst *B) {
+      PairKey K = makePairKey(B);
+      Open[hashPairKey(K)].push_back({K, B});
+    };
+    auto popBeginForEnd = [&](CallInst *E) -> CallInst * {
+      PairKey K = makePairKey(E);
+      auto It = Open.find(hashPairKey(K));
+      if (It == Open.end())
+        return nullptr;
+      auto &Vec = It->second;
+      for (int i = (int)Vec.size() - 1; i >= 0; --i) {
+        if (samePairKey(Vec[i].first, K)) {
+          CallInst *B = Vec[i].second;
+          Vec.erase(Vec.begin() + i);
+          return B;
+        }
+      }
+      return nullptr;
+    };
+
+    unsigned Bi = 0, Ei = 0;
+    while (Bi < Begins.size() || Ei < Ends.size()) {
+      bool TakeBegin = (Ei >= Ends.size()) ||
+                       (Bi < Begins.size() &&
+                        instLess(BBIndex, Begins[Bi], Ends[Ei]));
+      if (TakeBegin) {
+        pushBegin(Begins[Bi++]);
+      } else {
+        CallInst *E = Ends[Ei++];
+        if (CallInst *B = popBeginForEnd(E))
+          BeginToEnd[B] = E;
+      }
+    }
+
+    DenseMap<size_t, Canonical> Canon;
+
+    for (CallInst *BeginCI : Begins) {
+      OffloadArray CurOAs[4];
+      if (!getValuesInOffloadArrays(*BeginCI, CurOAs))
+        continue;
+
+      Value *CurIdent = BeginCI->getArgOperand(0);
+      Value *CurDev = BeginCI->getArgOperand(1);
+      Value *CurNArgs = BeginCI->getArgOperand(2);
+
+      // begins-only maptypes representative from analysis (not pairing key)
+      Value *CurBeginMapTypesArray = CurOAs[3].Array;
+
+      CallInst *EndCI = BeginToEnd.lookup(BeginCI);
+
+      size_t H = hashBeginClass(*BeginCI, CurOAs);
+
+      auto It = Canon.find(H);
+      if (It == Canon.end()) {
+        Canonical C;
+        C.BaseArr = BeginCI->getArgOperand(OffloadArray::BasePtrsArgNum);
+        C.PtrArr  = BeginCI->getArgOperand(OffloadArray::PtrsArgNum);
+        C.SizeArr = BeginCI->getArgOperand(OffloadArray::SizesArgNum);
+
+        C.Ident = CurIdent;
+        C.Dev = CurDev;
+        C.NArgs = CurNArgs;
+
+        C.BeginMapTypesArray = CurBeginMapTypesArray;
+
+        if (EndCI) {
+          OffloadArray EndOAs[4];
+          if (getValuesInOffloadArrays(*EndCI, EndOAs))
+            C.EndMapTypesArray = EndOAs[3].Array;
+        }
+
+        for (int i = 0; i < 4; ++i)
+          C.OAs[i] = CurOAs[i];
+
+        Canon.try_emplace(H, std::move(C));
+        continue;
+      }
+
+      Canonical &C = It->second;
+
+      if (C.Ident != CurIdent || C.Dev != CurDev || C.NArgs != CurNArgs)
+        continue;
+
+      // Compare maptypes within BEGINS:
+      if (C.BeginMapTypesArray != CurBeginMapTypesArray)
+        continue;
+
+      if (!sameOffloadArrays(C.OAs, CurOAs))
+        continue;
+
+      rewriteArrays(*BeginCI, C.BaseArr, C.PtrArr, C.SizeArr);
+
+      // Compare maptypes within ENDS (if we can analyze the end):
+      if (EndCI && C.EndMapTypesArray) {
+        OffloadArray EndOAs[4];
+        if (getValuesInOffloadArrays(*EndCI, EndOAs) &&
+            EndOAs[3].Array == C.EndMapTypesArray) {
+          rewriteArrays(*EndCI, C.BaseArr, C.PtrArr, C.SizeArr);
+        }
+      }
+
+      Changed = true;
+    }
+  }
+
+  return Changed;
+}
+
 
   /// Tries to hide the latency of runtime calls that involve host to
   /// device memory transfers by splitting them into their "issue" and "wait"
@@ -1594,6 +1901,7 @@ private:
 
     Changed |= moveStoredValuesUpwards(BeginRFI, EndRFI);
     Changed |= hoistMemTransfersOutOfLoops(BeginRFI, EndRFI);
+    Changed |= reuseVariables(BeginRFI, EndRFI);
 
     auto SplitMemTransfers = [&](Use &U, Function &Decl) {
       auto *RTCall = getCallIfRegularCall(U, &BeginRFI);
@@ -1622,6 +1930,7 @@ private:
 
     return Changed;
   }
+  
 
   bool
   moveStoredValuesUpwards(OMPInformationCache::RuntimeFunctionInfo &BeginRFI,
