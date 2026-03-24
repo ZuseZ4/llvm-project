@@ -1986,6 +1986,17 @@ private:
     }
     return Changed;
   }
+  bool FuseDifferentTransfers(
+      OMPInformationCache::RuntimeFunctionInfo &BeginRFI,
+      OMPInformationCache::RuntimeFunctionInfo &EndRFI) {
+    // Find two begin mappers in the same BB.
+    // Figure out which is first.
+    // Verify no arg modifications between the two.
+    // Impl heuristic for merging (`yes` for now).
+    // Create copy of both functions which takes both args 
+    // Create copy of mappers which handle both args
+    // Replace both functions and both regions with new ones.
+  }
 
   /// Tries to hide the latency of runtime calls that involve host to
   /// device memory transfers by splitting them into their "issue" and "wait"
@@ -2001,6 +2012,7 @@ private:
     Changed |= moveStoredValuesUpwards(BeginRFI, EndRFI);
     Changed |= hoistMemTransfersOutOfLoops(BeginRFI, EndRFI);
     Changed |= CanonicalTransfers(BeginRFI, EndRFI);
+    Changed |= FuseDifferentTransfers(BeginRFI, EndRFI);
 
     auto SplitMemTransfers = [&](Use &U, Function &Decl) {
       auto *RTCall = getCallIfRegularCall(U, &BeginRFI);
