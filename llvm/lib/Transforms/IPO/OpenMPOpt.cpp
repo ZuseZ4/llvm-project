@@ -1581,6 +1581,412 @@ private:
     return false;
   }
 
+  CallBase *findNextCallUsingOperandInBB(CallBase *CallA) {
+    Value *Op = CallA->getOperand(0);
+  
+    for (Instruction *I = CallA->getNextNode(); I; I = I->getNextNode()) {
+      auto *CB = dyn_cast<CallBase>(I);
+      if (!CB)
+        continue;
+  
+      for (unsigned J = 0; J < CB->arg_size(); ++J) {
+        if (CB->getOperand(J) == Op)
+          return CB;
+      }
+    }
+  
+    return nullptr;
+  }
+
+  // This function takes two begin_mappers a and b.
+  // For both, it first checks that the next two args are the kernel call and end_mapper.
+  // It then implements the following optimization, under the assumption that we previously 
+  // proved that argsA & argsB are effectively identical:
+  // ```
+  // begin_mapper(argsA);
+  // kernel(kernel_argsA);
+  // end_mapper(argsA);
+  // ...
+  // begin_mapper(argsB);
+  // kernel(kernel_argsB);
+  // end_mapper(argsB);
+  // ```
+  // to
+  // ```
+  // begin_mapper(argsA);
+  // kernel(kernel_argsA);
+  // end_mapper(argsA);
+  // ...
+  // begin_mapper(argsA);
+  // kernel(kernel_argsA);
+  // end_mapper(argsA);
+  // ```
+  // If we further notice that `end_mapper(argsA)` and `begin_mapper(argsB)` are consecutive instructions
+  // with no calls in between, then we set the two CallBase pointers. This allows us to later simplify
+  // the optimized example from above further to
+  // ```
+  // begin_mapper(argsA);
+  // kernel(kernel_argsA);
+  // kernel(kernel_argsA);
+  // end_mapper(argsA);
+  // ```
+  void ReplaceArgs(Use *A, Use *B,
+      OMPInformationCache::RuntimeFunctionInfo *BeginRFI,
+      CallBase *&intermediateBegin, CallBase *&intermediateEnd) {
+    // 1. Figure out if A or B are first
+    // 2. Replace all 4 mappers, as far as needed
+    CallBase *IA = dyn_cast<CallBase>(A->getUser());
+    CallBase *IB = dyn_cast<CallBase>(B->getUser());
+    
+    assert(IA && IB);
+    assert(IA->getParent() == IB->getParent());
+    
+    bool AComesFirst = IA->comesBefore(IB);
+    LLVM_DEBUG(errs() << (AComesFirst ? "AComesFirst" : "BComesFirst") << "\n" << *IA << "\n" << *IB << "\n");
+
+    CallBase *First = AComesFirst ? IA : IB;
+    CallBase *Second = AComesFirst ? IB : IA;
+
+    CallBase *FirstKernel = findNextCallUsingOperandInBB(First); 
+    CallBase *FirstEnd = findNextCallUsingOperandInBB(FirstKernel); 
+    if (!FirstKernel || !FirstEnd) {
+      LLVM_DEBUG(errs() << "Failed to find kernel or end for the first function!\n");
+      return;
+    }
+
+    CallBase *SecondKernel = findNextCallUsingOperandInBB(Second);
+    CallBase *SecondEnd = findNextCallUsingOperandInBB(SecondKernel);
+    if (!SecondKernel || !SecondEnd) {
+      LLVM_DEBUG(errs() << "Failed to find kernel or end for the second function!\n");
+      return;
+    } else {
+      // TODO: verify we cought kernel/end mapper, but correct at the moment (checked manually)
+      LLVM_DEBUG(errs() << "Kernel: " << *SecondKernel << "\nEnd: " << *SecondEnd << "\n");
+    }
+
+    for (int i = 3; i <= 6; i++) {
+      Second->setArgOperand(i, First->getArgOperand(i));
+      SecondEnd->setArgOperand(i, FirstEnd->getArgOperand(i));
+    }
+    SecondKernel->setArgOperand(5, FirstKernel->getArgOperand(5));
+
+    CallBase *NextBegin = findNextCallUsingOperandInBB(FirstEnd);
+    if (NextBegin) {
+      if (NextBegin == Second) {
+        intermediateEnd = FirstEnd;
+        intermediateBegin = Second;
+        LLVM_DEBUG(errs() << "Managed to find next begin mapper after current end mapper function!\n");
+      } else {
+        LLVM_DEBUG(errs() << "Failed to find next begin mapper after current end mapper function!\n");
+        LLVM_DEBUG(errs() << *NextBegin << "\n" << *Second << "\n" << (NextBegin == Second) << "\n");
+      }
+    } else {
+      LLVM_DEBUG(errs() << "Failed to find next begin mapper after current end mapper function!\n");
+      LLVM_DEBUG(errs() << " NextBegin was nullptr. Second: " << *Second << " " << (NextBegin == Second) << "\n");
+      return;
+    }
+  }
+
+  bool CanonicalTransfers(
+      OMPInformationCache::RuntimeFunctionInfo &BeginRFI,
+      OMPInformationCache::RuntimeFunctionInfo &EndRFI) {
+    bool Changed = false;
+    bool Hoisted = false;
+
+    // For each unprocessed begin_mapper a in a Function:
+    //   For each other begin_mapper b in same Function:
+    //     check if DeviceID and other scalars are identical between a and b // const hardcoded values or identical global, so trivial
+    //     for each of the 3 arrays (ignoring maptypes a sec):
+    //        for each value in an array check that:
+    //           the value has 4 uses (one store into it "init", one use in begin_mapper, one use in end_mapper, and it's once stored into kernel_args)
+    //           the init value is the same for a and b // Use DT here?
+    //     for each value in maptypes check that:
+    //        the last store into it is identical for the begin mapper in `a` and `b` // DT
+    //        the last store into it is identical for the end mapper in `a` and `b` // DT
+    //     if (all_checks_passed)
+    //       store {a,b} into a todo list to replace args of the latter by the former. See ReplaceArgs()
+    auto CompareFirstArgs = [&](Use &A, Use &B, OMPInformationCache::RuntimeFunctionInfo *RFI) {
+      auto *CallA = getCallIfRegularCall(A, &BeginRFI);
+      auto *CallB = getCallIfRegularCall(B, &BeginRFI);
+
+      if (!CallA || !CallB)
+        return false;
+
+      // Necessary condition for both data mapper regions to share variables:
+      for (int i = 0; i < 3; i++) {
+        if (CallA->getOperand(i) != CallB->getOperand(i)) {
+          LLVM_DEBUG(errs() << "Not fusing due to differing argument nr " << i << " " << CallA << " " << CallB << "\n");
+          return false;
+        }
+      }
+
+      Value *NumArgsV = CallA->getArgOperand(2);
+      auto *CNumArgs = dyn_cast<ConstantInt>(NumArgsV);
+      if (!CNumArgs) {
+        LLVM_DEBUG(errs() << "failed to read: " << CNumArgs << " " << NumArgsV << "\n");
+        return false;
+      }
+      int num_args = static_cast<int>(CNumArgs->getZExtValue());
+
+      // We check that each map is used just as we expect it.
+      // That is, num_args writes, plus 3 uses for begin/kernel/end mapper.
+      size_t expected_uses = 3 + num_args;
+      bool all_clear = true;
+      for (int i = 3; i <= 6; i++) {
+        auto OffloadArrayA_i = CallA->getOperand(i);
+        auto OffloadArrayB_i = CallB->getOperand(i);
+
+        if (isa<GlobalValue>(OffloadArrayA_i)) {
+          if (!isa<GlobalValue>(OffloadArrayB_i)) {
+            LLVM_DEBUG(errs() << "Not fusing due to differing global / local arg: " << *CallA << " " << *CallB << "\n");
+          }
+          if (OffloadArrayA_i != OffloadArrayB_i) {
+            LLVM_DEBUG(errs() << "Not fusing due to differing globals: " << *CallA << " " << *CallB << "\n");
+            return false;
+          } else {
+            continue;
+          }
+        }
+
+        size_t numUsesA = OffloadArrayA_i->getNumUses();
+        size_t numUsesB = OffloadArrayB_i->getNumUses();
+        if (numUsesA != expected_uses) {
+          LLVM_DEBUG(errs() << "expected_uses: " << expected_uses << ", but got: " << numUsesA);
+          LLVM_DEBUG(errs() << "CallA: " << *CallA << ",  CallB: " << *CallB);
+          LLVM_DEBUG(errs() << "OA: " << *OffloadArrayA_i << ",  OB: " << *OffloadArrayB_i);
+          return false;
+        }
+        if (numUsesB != expected_uses) {
+          LLVM_DEBUG(errs() << "expected_uses: " << expected_uses << ", but got: " << numUsesB);
+          return false;
+        }
+        auto UsesA = OffloadArrayA_i->users();
+        auto UsesB = OffloadArrayB_i->users();
+        auto UseA = UsesA.begin();
+        auto UseB = UsesB.begin();
+        bool store_into = false;
+        bool store_from = false;
+        bool begin_mapper = false;
+        bool end_mapper = false;
+        int store_geps = 0;
+        while (true) {
+          // We expect:
+          // 2x store: Once direct store of a scalar into it. Once into another ptr (for kernel_args)
+          // (CNumArgs - 1)x GEP (to store other elements at non-zero offset)
+          // 2x call begin_mapper and end_mapper.
+          if (UseA == UsesA.end() || UseB == UsesB.end()) {
+            break;
+          }
+
+          if (CallBase *CA = dyn_cast<CallBase>(*UseA)) {
+            CallBase *CB = dyn_cast<CallBase>(*UseB);
+            if (!CB) {
+              LLVM_DEBUG(errs() << "differing uses are unhandled! " << **UseA << "\n" << **UseB << "\n\n");
+              return false;
+            }
+            if (CA->getCalledFunction() == BeginRFI.Declaration && CB->getCalledFunction() == BeginRFI.Declaration) {
+              begin_mapper = true;
+            } else if (CA->getCalledFunction() == EndRFI.Declaration && CB->getCalledFunction() == EndRFI.Declaration) {
+              end_mapper = true;
+            } else {
+              LLVM_DEBUG(errs() << "Unhandled called function: " << *CA << " " << *CB);
+              return false;
+            }
+          } else if (auto *storeA = dyn_cast<StoreInst>(*UseA)) {
+              auto *storeB = dyn_cast<StoreInst>(*UseB);
+              if (!storeB) {
+                LLVM_DEBUG(errs() << "differing uses are unhandled! " << **UseA << "\n" << **UseB << "\n\n");
+                return false;
+              }
+              auto storeOpA = storeA->getPointerOperand();
+              auto storeOpB = storeB->getPointerOperand();
+              auto storeInstrA = dyn_cast<Instruction>(storeOpA);
+              auto storeInstrB = dyn_cast<Instruction>(storeOpB);
+              if (storeOpA == OffloadArrayA_i && storeOpB == OffloadArrayB_i) {
+                if (storeA->getValueOperand() == storeB->getValueOperand()) {
+                  //LLVM_DEBUG(errs() << "matched store into OffloadArrays: " << **UseA << " " << **UseB << "\n");
+                  store_into = true;
+                } else {
+                    // differing stores:   store ptr %_4.i, ptr %.offload_ptrs, align 8   store ptr %_4.i143, ptr %.offload_ptrs19, align 8
+                    auto *foo = storeA->getValueOperand();
+                    auto *bar = storeB->getValueOperand();
+                    auto *CBA = dyn_cast<CallBase>(foo);
+                    auto *CBB = dyn_cast<CallBase>(bar);
+                    if (CBA && CBB) {
+                      if (CBA == CBB || CBA->isIdenticalTo(CBB)) {
+                        //LLVM_DEBUG(errs() << "indirectly matched store into OffloadArrays: " << **UseA << " " << **UseB << "\n");
+                        store_into = true;
+                      } else {
+                        LLVM_DEBUG(errs() << "FAllocas a CallBase but not equal\n");
+                        LLVM_DEBUG(errs() << *CBA << " " << *CBB << "\n");
+                      }
+                    } else {
+                      LLVM_DEBUG(errs() << "FAllocas not a CallBase\n");
+                    }
+                }
+              } else if (storeA->getValueOperand() == OffloadArrayA_i && storeB->getValueOperand() == OffloadArrayB_i) {
+                  //LLVM_DEBUG(errs() << "matched store from: " << **UseA << " " << **UseB << "\n");
+                  store_from = true;
+                // TODO: make sure we store into kernel_args in both cases
+              } else {
+                  LLVM_DEBUG(errs() << "unhandled stores: " << **UseA << " " << **UseB << "\n");
+                  return false;
+              }
+          } else if (auto *GEPA = dyn_cast<GetElementPtrInst>(*UseA)) {
+            auto *GEPB = dyn_cast<GetElementPtrInst>(*UseB);
+            if (!GEPB) {
+               LLVM_DEBUG(errs() << "differing GEP: " << **UseA << " " << **UseB << "\n");
+               return false;
+            }
+            if ((GEPA->getNumUses() == 1 && GEPB->getNumUses() == 1) &&
+                (GEPA->getNumIndices() == 1 && GEPB->getNumIndices() == 1) &&
+                (*GEPA->idx_begin() == *GEPB->idx_begin())) {
+                  auto *storeA = dyn_cast<StoreInst>(*GEPA->users().begin());
+                  auto *storeB = dyn_cast<StoreInst>(*GEPB->users().begin());
+                  if (!storeA || !storeB) {
+                    LLVM_DEBUG(errs() << "expected a store, but got" << **UseA << " " << **UseB << "\n");
+                  }
+                  // Here it get's interesting. Mostly we have scalars, but sometimes also ptrs storing into ptrs. In that case go one level deeper.
+               
+                  auto OperandA = storeA->getValueOperand();
+                  auto OperandB = storeB->getValueOperand();
+                  if (OperandA == OperandB) {
+                      //LLVM_DEBUG(errs() << "Matched scalar stores of: " << *storeA->getValueOperand() << "\n");
+                  } else {
+                    // This should be an alloca, with 2 uses. Alloc, write, read.
+                    auto *AllocaA = dyn_cast<AllocaInst>(OperandA);
+                    auto *AllocaB = dyn_cast<AllocaInst>(OperandB);
+                    if (!AllocaA || !AllocaB) {
+                        LLVM_DEBUG(errs() << "expected an alloca, but got" << **UseA << " " << **UseB << "\n");
+                        LLVM_DEBUG(errs() << "expected an alloca, but got" << *storeA << " " << *storeB << "\n");
+                        LLVM_DEBUG(errs() << "expected an alloca, but got" << *storeA->getValueOperand() << " " << *storeB->getValueOperand() << "\n");
+                        return false;
+                    }
+                    if (AllocaA->getNumUses() != 2 || AllocaB->getNumUses() != 2) {
+                        LLVM_DEBUG(errs() << "Allocas have wrong nr of users: " << AllocaA->getNumUses() << "" << AllocaB->getNumUses() << "\n");
+                        return false;
+                    } else {
+                      // We know there is one Load. So at max one store (since we have 2 uses).
+                      StoreInst *storeA;
+                      StoreInst *storeB;
+                      for (auto use : AllocaA->users()) {
+                        if (auto *store = dyn_cast<StoreInst>(use)) {
+                          storeA = store;
+                        }
+                      }
+                      for (auto use : AllocaB->users()) {
+                        if (auto *store = dyn_cast<StoreInst>(use)) {
+                          storeB = store;
+                        }
+                      }
+                      if (!storeA || !storeB) {
+                        LLVM_DEBUG(errs() << " failed to understand: " << *AllocaA << " " << *AllocaB << "\n");
+                        return false;
+                      }
+                      if (storeA->getValueOperand() != storeB->getValueOperand()) {
+                        LLVM_DEBUG(errs() << " Can't fuse due to different store vals: " << *storeA << " " << *storeB << "\n");
+                        return false;
+                      }
+
+                      //LLVM_DEBUG(errs() << "Nested matched scalar stores of: " << *storeA << " " << *storeB << "\n");
+                    }
+                  }
+                  // store i64 8, ptr %12, align 8
+                  //LLVM_DEBUG(errs() << "Matched store with val: " << storeA->getValueOperand() << " " << storeB->getValueOperand() << "\n");
+                  store_geps++;
+            } else {
+              LLVM_DEBUG(errs() << "unhandled GEPs: " << *GEPA << " " << *GEPB << "\n");
+              LLVM_DEBUG(errs() << "numUses: " << GEPA->getNumUses() << " " << GEPB->getNumUses());
+              LLVM_DEBUG(errs() << "getNumIndices: " << GEPA->getNumIndices() << " " << GEPB->getNumIndices());
+              LLVM_DEBUG(errs() << "index: " << GEPA->idx_begin() << " " << GEPB->idx_begin());
+              LLVM_DEBUG(errs() << "resulting from unhandled Use: " << **UseA << " " << **UseB << "\n");
+              return false;
+            }
+          } else {
+            LLVM_DEBUG(errs() << "unhandled Usage: " << **UseA << " " << **UseB << "\n");
+            return false;
+          }
+
+          // We expect:
+          // 1x direct store of a scalar into it.
+          // CNumArgs - 1 gep's (to store other elements at non-zero offset)
+          // 1x call begin_mapper.
+          // 1x call end_mapper
+          // 1x stored into another ptr (for kernel_args)
+          UseA++;
+          UseB++;
+        }
+        if (!(store_into && store_from && begin_mapper && end_mapper && (store_geps == num_args -1))) {
+          LLVM_DEBUG(errs() << "Not all clear. store_into: " << store_into << ", store_from: " << store_from);
+          LLVM_DEBUG(errs() << ", begin_mapper: " << begin_mapper << ", end_mapper: " << end_mapper);
+          LLVM_DEBUG(errs() << ", store_geps: " << store_geps << ", expected: " << num_args-1 << "\n\n");
+          all_clear = false;
+        } else {
+          LLVM_DEBUG(errs() << "All clear\n");
+        }
+      }
+
+      // Maptypes are handled via globals, so should have already been deduplicated.
+      if (CallA->getOperand(6) != CallB->getOperand(6)) {
+        LLVM_DEBUG(errs() << "Not fusing due to not sharing maptypes" << *CallA << " " << *CallB << "\n");
+        return false;
+      }
+
+      // The last two arguments represent dbg info, which we don't handle yet.
+      if (!CallA->getOperand(7) && !CallA->getOperand(8) && !CallB->getOperand(7) && !CallB->getOperand(8)) {
+        LLVM_DEBUG(errs() << "Not fusing due to not handling debug info" << *CallA << " " << *CallB << "\n");
+        return false;
+      }
+
+      LLVM_DEBUG(errs() << " " << num_args << " returning equal\n");
+      return all_clear;
+    };
+
+    struct PendingRewrite {
+      Use *From;
+      Use *To;
+    };
+
+    for (Function *F : SCC) {
+      OMPInformationCache::RuntimeFunctionInfo::UseVector &UV = BeginRFI.getOrCreateUseVector(F);
+      SmallVector<PendingRewrite, 8> Rewrites;
+      for (unsigned I = 0; I < UV.size(); ++I) {
+        for (unsigned J = I + 1; J < UV.size(); ++J) {
+          Use *U = UV[I];
+          Use *V = UV[J];
+      
+          if (CompareFirstArgs(*U, *V, &BeginRFI)) {
+            LLVM_DEBUG(errs() << "Adding : " << **U << "\n" << **V << "\n");
+            Rewrites.push_back({U, V});
+          }
+        }
+      }
+
+    struct PendingDeletes {
+      CallBase *End;
+      CallBase *Begin;
+    };
+      
+      SmallVector<PendingDeletes, 8> ToFuse;
+      for (const PendingRewrite &R : Rewrites) {
+        CallBase *intermediateBegin = nullptr;
+        CallBase *intermediateEnd = nullptr;
+        ReplaceArgs(R.From, R.To, &BeginRFI, intermediateBegin, intermediateEnd);
+        if (intermediateBegin && intermediateEnd) {
+          ToFuse.push_back({intermediateBegin, intermediateEnd});
+          LLVM_DEBUG(errs() << "Storing a pair for deletion!\n");
+        }
+      }
+      LLVM_DEBUG(errs() << "Length of ToFuse: " << ToFuse.size() << "\n");
+      for (PendingDeletes ToBeDeleted : ToFuse) {
+        ToBeDeleted.End->eraseFromParent();
+        ToBeDeleted.Begin->eraseFromParent();
+        LLVM_DEBUG(errs() << "Deleted a pair!\n");
+      }
+    }
+    return Changed;
+  }
+
   /// Tries to hide the latency of runtime calls that involve host to
   /// device memory transfers by splitting them into their "issue" and "wait"
   /// versions. The "issue" is moved upwards as much as possible. The "wait" is
@@ -1594,6 +2000,7 @@ private:
 
     Changed |= moveStoredValuesUpwards(BeginRFI, EndRFI);
     Changed |= hoistMemTransfersOutOfLoops(BeginRFI, EndRFI);
+    Changed |= CanonicalTransfers(BeginRFI, EndRFI);
 
     auto SplitMemTransfers = [&](Use &U, Function &Decl) {
       auto *RTCall = getCallIfRegularCall(U, &BeginRFI);
